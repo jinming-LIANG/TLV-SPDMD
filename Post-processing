@@ -1,0 +1,215 @@
+clear all;
+close all;
+clc;
+
+%% 1. 数据准备
+% 加载数据，假设 data.mat 包含变量 VelX 和 VelY
+load('E:\DMD\interpolation\spdm结果选取\60+450i\data.mat');  
+Fs = 10;  % 采样频率
+Var = [VelX; VelY];
+% 构造快照矩阵：X0（第1到N-1帧）和 X1（第2到N帧）
+X0 = Var(:, 1:end-1);
+X1 = Var(:, 2:end);
+N_snap = size(X0, 2);
+
+%% 2. 标准 DMD 分解（Schmid 算法）
+% 对 X0 进行 economy-size SVD
+[U,S,V] = svd(X0, 'econ');
+UstarX1 = U' * X1;
+% 构造 DMD 算子 Fdmd
+Fdmd = (UstarX1 * V) / S;
+% 对 Fdmd 进行特征值分解
+[Ydmd, Ddmd] = eig(Fdmd);
+Edmd = diag(Ddmd);  % 离散时间特征值
+
+%% 3. 计算 DMD 模态与初始振幅
+% 计算 DMD 模态 Phi（基于原始数据 X1）
+Phi = X1 * V / S * Ydmd;
+% 计算初始振幅（最小二乘解）：使 X0 ≈ Phi * diag(b)
+b = Phi \ X0(:, 1);
+
+%% 4. 构造 Vandermonde 矩阵（时域演化矩阵）
+% 设定有效模态数为 r（也可直接取 length(Edmd)）
+r = rank(Fdmd);
+Q = zeros(r, N_snap);
+for k = 1:N_snap
+    Q(:, k) = Edmd.^(k-1);
+end
+
+%% 5. 构造重构问题并计算最小二乘解
+% 目标：最小化 || X0 - Phi*diag(x)*Q ||_F^2
+% 将其写成二次型： J(x)= x'*P*x - 2*Re(q'*x) + s
+P = (Phi' * Phi) .* conj(Q * Q');
+q = conj(diag(Q * (X0') * Phi));
+s = trace(X0' * X0);
+
+% 非稀疏最小二乘解（参考解）
+Pl = chol(P, 'lower');
+xdmd = (Pl') \ (Pl \ q);
+fprintf('非稀疏最小二乘解 xdmd:\n');
+disp(xdmd);
+
+%% 6. 调用稀疏促进算法 dmdsp
+gamma_grd = 200;  % gamma 网格点数
+gammaval = logspace(log10(100), log10(10000), gamma_grd);  % gamma 取值范围（对数尺度）
+options = struct('rho', 1, 'maxiter', 10000, 'eps_abs', 1e-6, 'eps_rel', 1e-4);
+tic;
+answer = dmdsp(P, q, s, gammaval, options);
+
+%% 7. 对稀疏解进行后处理分析
+% 为确保后续索引不越界，将稀疏振幅解截取为前 r 个元素
+idx_best = find(answer.Ploss < 19.91, 1, 'last');  % 选择性能损失低于16.5%的第一个解
+if isempty(idx_best)
+    [~, idx_best] = min(answer.Ploss);  % 找不到则选择性能损失最小的解
+end
+x_sparse_all = answer.xsp;
+x_sparse = answer.xsp(1:r, idx_best);
+
+% 计算各模态的能量和频率（仅对有效模态）
+threshold = 1e-8;
+active_modes = find(abs(x_sparse) > threshold);
+if isempty(active_modes)
+    warning('没有检测到有效的稀疏模态，阈值可能过大！');
+else
+    Energy_sparse = zeros(length(active_modes), 1);
+    freq_sparse = zeros(length(active_modes), 1);
+    for j = 1:length(active_modes)
+        i = active_modes(j);
+        % 模态在时域的信号：x_sparse(i)*Q(i,:)
+        mode_signal = x_sparse(i) * Q(i, :);
+        % 能量计算：基于对应 DMD 模态 Phi(:,i)
+        Energy_sparse(j) = norm(Phi(:, i) * mode_signal, 'fro')^2;
+        % 频率计算： f = imag(log(lambda)*Fs)/(2*pi)
+        freq_sparse(j) = imag(log(Edmd(i)) * Fs) / (2 * pi);
+    end
+    % 按能量降序排序，仅保留有效模态
+    [Energy_sorted, idx_sort] = sort(Energy_sparse, 'descend');
+    active_modes_sorted = active_modes(idx_sort);
+    freq_sorted = freq_sparse(idx_sort);
+    lambda_sorted = Edmd(active_modes_sorted);
+    x_sparse_sorted = x_sparse(active_modes_sorted);
+    % 提取排序后的 DMD 模态
+    Phi_sorted = Phi(:, active_modes_sorted);
+
+    fprintf('\n稀疏DMD分解结果（排序后，仅保留有效模态）：\n');
+    fprintf('模式\t能量\t\t\t频率(Hz)\n');
+    for j = 1:length(active_modes_sorted)
+        fprintf('%d\t%e\t%e\n', active_modes_sorted(j), Energy_sorted(j), freq_sorted(j));
+    end
+end
+
+%% 8. 绘制稀疏DMD模态的时间演化行为
+% 绘制前几个模态的演化行为（最多绘制7个）
+num_modes_to_plot = min(7, length(active_modes_sorted));  
+time = (0:N_snap-1) / Fs;  % 时间轴（秒）
+
+% 初始化结构体数组，用于存储每个模态的数据
+mode_data = struct();
+
+figure;
+for k = 1:num_modes_to_plot
+    % 使用排序后的顺序：对应第 k 个有效稀疏模态
+    idx = active_modes_sorted(k);
+    signal = x_sparse_sorted(k) * Q(idx, :);  % 模态在时间上的演化信号
+    
+    % 将数据转换为列向量
+    time_col = time(:);
+    real_signal_col = real(signal(:));
+    abs_signal_col = abs(signal(:));
+    
+    % 将数据存入结构体中
+    mode_data(k).mode_index   = idx;           % 模态在原始数据中的索引
+    mode_data(k).time         = time_col;      % 时间向量（列向量）
+    mode_data(k).real_signal  = real_signal_col; % 实部信号（列向量）
+    mode_data(k).abs_signal   = abs_signal_col;  % 信号模值（列向量）
+    
+    % 绘图部分
+    subplot(num_modes_to_plot, 1, k);
+    plot(time, real(signal), 'b', 'LineWidth', 1.5); hold on;
+    plot(time, abs(signal), 'r--', 'LineWidth', 1);  % 绘制信号模值
+    xlabel('时间 (s)');
+    ylabel(sprintf('模态 %d', k));
+    title(sprintf('第%d阶稀疏模态的时域演化（实部 & 模值）', k));
+    legend('Re(signal)', '|signal|');
+    grid on;
+end
+sgtitle('稀疏DMD模态的时间演化行为（按能量降序）');
+
+% 保存数据到 MAT 文件中
+save('E:\DMD\interpolation\spdm结果选取\60+450i\结果分析\数据图\mode_data.mat', 'mode_data');
+saveas(gcf, 'E:\DMD\interpolation\spdm结果选取\60+450i\结果分析\数据图\f.png');
+
+%% 9. 绘制 gamma 与稀疏模态数及性能损失的关系图
+figure;
+subplot(2,1,1);
+semilogx(gammaval, answer.Nz, '-o');
+ylabel('稀疏模态数');
+xlabel('\gamma');
+title('模态数量随 \gamma 变化');
+subplot(2,1,2);
+semilogx(gammaval, answer.Ploss, '-o');
+ylabel('性能损失(%)');
+xlabel('\gamma');
+title('性能损失随 \gamma 变化');
+ saveas(gcf, 'E:\DMD\interpolation\spdm结果选取\60+450i\结果分析\数据图\nz-pl-g.png');
+
+%% 10. 保存关键结果至工作区及文件
+assignin('base', 'Fdmd', Fdmd);
+assignin('base', 'Edmd', Edmd);
+assignin('base', 'Ydmd', Ydmd);
+assignin('base', 'xdmd', xdmd);
+assignin('base', 'answer', answer);
+if exist('Energy_sorted','var'); assignin('base', 'Energy_sorted', Energy_sorted); end
+if exist('freq_sorted','var'); assignin('base', 'freq_sorted', freq_sorted); end
+
+gamma = answer.gamma';
+xsp = answer.xsp';
+xpol = answer.xpol';
+Jsp = answer.Jsp';
+Jpol = answer.Jpol';
+Nz   = answer.Nz';
+Ploss = answer.Ploss';
+ save('E:\DMD\interpolation\spdm结果选取\60+450i\结果分析\数据图\spdata.mat',...
+    'Fdmd','Edmd','Ydmd','xdmd','gamma','xsp','xpol','Jsp','Jpol','Nz','Ploss','answer',"freq_sorted","Energy_sorted","Phi_sorted","lambda_sorted","x_sparse_sorted");
+
+%% 11. 基于稀疏DMD结果生成各模态时域信号及流场重构
+% 假设数据的前5695行为 VelX，后5695行为 VelY
+
+% 11.1 单独生成每个有效稀疏模态的时域信号并保存
+for i = 1:length(active_modes_sorted)
+    % 此处按排序顺序命名：第1阶、...、第N阶稀疏模态
+    sorted_index = active_modes_sorted(i);  
+    % 使用排序后的 DMD 模态 Phi_sorted 的第 i 列，与对应的 x_sparse_sorted(i)
+    mode_signal = real( Phi_sorted(:, i) * ( x_sparse_sorted(i) * Q(sorted_index, :) ) );
+    
+    % 分离出 VelX 和 VelY（假设前5695行为 VelX）
+    VelX_mode = mode_signal(1:5695, :);
+    VelY_mode = mode_signal(5696:11390, :);
+    
+    % 保存时使用排序后顺序作为模态阶数
+    save(fullfile('E:\DMD\interpolation\spdm结果选取\60+450i',...
+         ['第', num2str(i), '阶稀疏模态.mat']), 'VelX_mode', 'VelY_mode');
+end
+
+% 11.2 对前几个有效稀疏模态进行叠加重构，并保存重构结果
+num_modes_to_reconstruct = min(7, length(active_modes_sorted));  % 根据需要选择叠加的模态数量
+for j = 1:num_modes_to_reconstruct
+    % 初始化重构矩阵，大小与原始数据一致
+    W_re = zeros(size(Phi, 1), size(Q, 2));
+    
+    for k = 1:j
+         sorted_index = active_modes_sorted(k);
+         W_re = W_re + real( Phi_sorted(:, k) * ( x_sparse_sorted(k) * Q(sorted_index, :) ) );
+    end
+    
+    % 分离出各变量（假设前5695行为 VelX）
+    VelX_re = W_re(1:5695, :);
+    VelY_re = W_re(5696:11390, :);
+    
+    % 保存时使用叠加的模态阶数命名
+    save(fullfile('E:\DMD\interpolation\spdm结果选取\60+450i',...
+         ['前', num2str(j), '阶稀疏模态重构流场.mat']), 'VelX_re', 'VelY_re');
+end
+
+%% 12. 结束计时
+toc;
